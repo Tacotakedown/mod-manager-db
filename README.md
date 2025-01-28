@@ -4,10 +4,6 @@
 
 Marvel Rivals Mod Manager DB is a RESTful api and database that allows for a faster and more seamless way to download mods for the people on my network using my mod manager
 
-## TODO
-
-- Better error handling
-
 ## Base URL
 
 ```

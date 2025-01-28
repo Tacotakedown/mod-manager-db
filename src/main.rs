@@ -2,6 +2,7 @@ use bytes::Buf;
 use futures::TryStreamExt;
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use std::{fs, sync::Arc};
 use tokio::sync::Mutex;
 use warp::{
@@ -20,6 +21,24 @@ struct ModMetadata {
 }
 
 type DbConnection = Arc<Mutex<Connection>>;
+
+#[derive(Debug)]
+struct DbError {
+    details: String,
+}
+impl warp::reject::Reject for DbError {}
+
+#[derive(Debug)]
+struct UploadError {
+    details: String,
+}
+impl warp::reject::Reject for UploadError {}
+
+#[derive(Debug)]
+struct FileError {
+    details: String,
+}
+impl warp::reject::Reject for FileError {}
 
 #[tokio::main]
 async fn main() {
@@ -56,7 +75,11 @@ async fn main() {
         .and(db_filter.clone())
         .and_then(handle_setup);
 
-    let routes = get_metadata.or(upload).or(download).or(setup);
+    let routes = get_metadata
+        .or(upload)
+        .or(download)
+        .or(setup)
+        .recover(handle_rejection);
 
     println!("Server started on localhost:8080");
     warp::serve(routes).run(([0, 0, 0, 0], 8080)).await;
@@ -81,7 +104,11 @@ async fn handle_get_metadata(db: DbConnection) -> Result<impl Reply, Rejection> 
     let conn = db.lock().await;
     let mut stmt = conn
         .prepare("SELECT id, title, version, thumbnail, file_path FROM mods")
-        .map_err(|_| warp::reject::custom(DbError))?;
+        .map_err(|e| {
+            warp::reject::custom(DbError {
+                details: e.to_string(),
+            })
+        })?;
 
     let mods = stmt
         .query_map([], |row| {
@@ -93,9 +120,17 @@ async fn handle_get_metadata(db: DbConnection) -> Result<impl Reply, Rejection> 
                 file_path: row.get(4)?,
             })
         })
-        .map_err(|_| warp::reject::custom(DbError))?
+        .map_err(|e| {
+            warp::reject::custom(DbError {
+                details: e.to_string(),
+            })
+        })?
         .collect::<Result<Vec<_>, _>>()
-        .map_err(|_| warp::reject::custom(DbError))?;
+        .map_err(|e| {
+            warp::reject::custom(DbError {
+                details: e.to_string(),
+            })
+        })?;
 
     Ok(warp::reply::json(&mods))
 }
@@ -113,36 +148,50 @@ async fn handle_upload(db: DbConnection, mut form: FormData) -> Result<impl Repl
         if let name = part.name() {
             match name {
                 "id" => {
-                    let value = read_part_to_string(part)
-                        .await
-                        .map_err(|_| warp::reject::custom(UploadError))?;
+                    let value = read_part_to_string(part).await.map_err(|e| {
+                        warp::reject::custom(UploadError {
+                            details: e.to_string(),
+                        })
+                    })?;
                     mod_metadata.id = value;
                 }
                 "title" => {
-                    let value = read_part_to_string(part)
-                        .await
-                        .map_err(|_| warp::reject::custom(UploadError))?;
+                    let value = read_part_to_string(part).await.map_err(|e| {
+                        warp::reject::custom(UploadError {
+                            details: e.to_string(),
+                        })
+                    })?;
                     mod_metadata.title = value;
                 }
                 "version" => {
-                    let value = read_part_to_string(part)
-                        .await
-                        .map_err(|_| warp::reject::custom(UploadError))?;
+                    let value = read_part_to_string(part).await.map_err(|e| {
+                        warp::reject::custom(UploadError {
+                            details: e.to_string(),
+                        })
+                    })?;
                     mod_metadata.version = value;
                 }
                 "thumbnail" => {
-                    let data = read_part_to_bytes(part)
-                        .await
-                        .map_err(|_| warp::reject::custom(UploadError))?;
+                    let data = read_part_to_bytes(part).await.map_err(|e| {
+                        warp::reject::custom(UploadError {
+                            details: e.to_string(),
+                        })
+                    })?;
                     let base64_thumbnail = base64::encode(&data);
                     mod_metadata.thumbnail = base64_thumbnail;
                 }
                 "file" => {
-                    let data = read_part_to_bytes(part)
-                        .await
-                        .map_err(|_| warp::reject::custom(UploadError))?;
+                    let data = read_part_to_bytes(part).await.map_err(|e| {
+                        warp::reject::custom(UploadError {
+                            details: e.to_string(),
+                        })
+                    })?;
                     let file_path = format!("mods/{}.gz", mod_metadata.id);
-                    fs::write(&file_path, data).map_err(|_| warp::reject::custom(UploadError))?;
+                    fs::write(&file_path, data).map_err(|e| {
+                        warp::reject::custom(UploadError {
+                            details: e.to_string(),
+                        })
+                    })?;
                     mod_metadata.file_path = file_path;
                 }
                 _ => {}
@@ -169,7 +218,7 @@ async fn handle_upload(db: DbConnection, mut form: FormData) -> Result<impl Repl
                 mod_metadata.file_path,
                 mod_metadata.id
             ],
-        ).map_err(|_| warp::reject::custom(DbError))?;
+        ).map_err(|e| warp::reject::custom(DbError{details:e.to_string()}))?;
     } else {
         conn.execute(
             "INSERT INTO mods (id, title, version, thumbnail, file_path) VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -180,7 +229,7 @@ async fn handle_upload(db: DbConnection, mut form: FormData) -> Result<impl Repl
                 mod_metadata.thumbnail,
                 mod_metadata.file_path
             ],
-        ).map_err(|_| warp::reject::custom(DbError))?;
+        ).map_err(|e| warp::reject::custom(DbError{details:e.to_string()}))?;
     }
 
     Ok(StatusCode::OK)
@@ -208,27 +257,74 @@ async fn handle_download(id: String, db: DbConnection) -> Result<impl Reply, Rej
             params![id],
             |row| row.get(0),
         )
-        .map_err(|_| warp::reject::custom(DbError))?;
+        .map_err(|e| {
+            warp::reject::custom(DbError {
+                details: e.to_string(),
+            })
+        })?;
 
-    let file_data = fs::read(&file_path).map_err(|_| warp::reject::custom(FileError))?;
+    let file_data = fs::read(&file_path).map_err(|e| {
+        warp::reject::custom(FileError {
+            details: e.to_string(),
+        })
+    })?;
     Ok(file_data)
 }
 
 async fn handle_setup(db: DbConnection) -> Result<impl Reply, Rejection> {
-    setup_db(db)
-        .await
-        .map_err(|_| warp::reject::custom(DbError))?;
+    setup_db(db).await.map_err(|e| {
+        warp::reject::custom(DbError {
+            details: e.to_string(),
+        })
+    })?;
     Ok(StatusCode::OK)
 }
 
-#[derive(Debug)]
-struct DbError;
-impl warp::reject::Reject for DbError {}
+async fn handle_rejection(err: Rejection) -> Result<impl Reply, std::convert::Infallible> {
+    if err.is_not_found() {
+        let json = warp::reply::json(&json!({
+            "code": StatusCode::NOT_FOUND.as_u16(),
+            "message": "Not Found"
+        }));
+        return Ok(warp::reply::with_status(json, StatusCode::NOT_FOUND));
+    }
 
-#[derive(Debug)]
-struct UploadError;
-impl warp::reject::Reject for UploadError {}
+    if let Some(e) = err.find::<DbError>() {
+        let json = warp::reply::json(&json!({
+            "code": StatusCode::INTERNAL_SERVER_ERROR.as_u16(),
+            "message": format!("Database error: {:?}", e)
+        }));
+        return Ok(warp::reply::with_status(
+            json,
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ));
+    }
 
-#[derive(Debug)]
-struct FileError;
-impl warp::reject::Reject for FileError {}
+    if let Some(e) = err.find::<UploadError>() {
+        let json = warp::reply::json(&json!({
+            "code": StatusCode::BAD_REQUEST.as_u16(),
+            "message": format!("Upload error: {:?}", e)
+        }));
+        return Ok(warp::reply::with_status(json, StatusCode::BAD_REQUEST));
+    }
+
+    if let Some(e) = err.find::<FileError>() {
+        let json = warp::reply::json(&json!({
+            "code": StatusCode::INTERNAL_SERVER_ERROR.as_u16(),
+            "message": format!("File error: {:?}", e)
+        }));
+        return Ok(warp::reply::with_status(
+            json,
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ));
+    }
+
+    let json = warp::reply::json(&json!({
+        "code": StatusCode::INTERNAL_SERVER_ERROR.as_u16(),
+        "message": "Internal Server Error"
+    }));
+    Ok(warp::reply::with_status(
+        json,
+        StatusCode::INTERNAL_SERVER_ERROR,
+    ))
+}
