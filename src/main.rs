@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{fs, sync::Arc};
 use tokio::sync::Mutex;
+use warp::cors;
 use warp::{
     Filter, Rejection, Reply,
     http::StatusCode,
@@ -75,11 +76,17 @@ async fn main() {
         .and(db_filter.clone())
         .and_then(handle_setup);
 
+    let cors = cors()
+        .allow_any_origin()
+        .allow_headers(vec!["Content-Type"])
+        .allow_methods(vec!["GET", "POST"]);
+
     let routes = get_metadata
         .or(upload)
         .or(download)
         .or(setup)
-        .recover(handle_rejection);
+        .recover(handle_rejection)
+        .with(cors);
 
     println!("Server started on localhost:8080");
     warp::serve(routes).run(([0, 0, 0, 0], 8080)).await;
